@@ -3,9 +3,10 @@
 
 A tiny round kitten asleep inside a mint-green teacup, seen from the side: a
 big soft cream head with two triangular ears, eyes drawn as two gentle closed
-arcs, a tiny pink nose, blush cheeks and one little paw draped over the rim.
-The cup carries a thin gold rim and a small heart; one thin curl of steam
-rises above it. Warm cream background with a very soft glow behind the cup.
+arcs, a tiny pink nose, blush cheeks and one little paw draped over the rim,
+joined to the cheek by a short arm. The cup carries a thin gold rim and a
+small heart; one thin curl of steam rises above it. Warm cream background with
+a very soft glow behind the cup.
 
 Rendering notes
 ---------------
@@ -185,6 +186,19 @@ WELL = ell_params(0.0, 0.820, 0.700, 0.078, 0.0)
 SHADOW = ell_params(0.0, 0.872, 0.860, 0.095, 0.0)
 HEAD = ell_params(0.0, -0.055, 0.340, 0.300, 0.0)
 PAW = ell_params(0.320, 0.115, 0.100, 0.125, 0.20)
+
+# short arm from the lower right of the head down to the paw: a capsule of
+# radius ARM_R (~40 px wide) whose ends are buried in the head and the paw
+ARM_AX = 0.194
+ARM_AY = 0.096
+ARM_BX = 0.228
+ARM_BY = 0.130
+ARM_R = 0.039
+_ARM_LEN = math.hypot(ARM_BX - ARM_AX, ARM_BY - ARM_AY)
+# unit perpendicular to the arm axis, pointing to its underside (down/left)
+ARM_NX = -(ARM_BY - ARM_AY) / _ARM_LEN
+ARM_NY = (ARM_BX - ARM_AX) / _ARM_LEN
+
 FOOT_SH = ell_params(0.0, 0.818, 0.470, 0.058, 0.0)
 
 # right ear, a rounded triangle; the left one is the mirror image
@@ -405,7 +419,7 @@ def render():
                         cb += (0.436 - cb) * cov
 
             # ---------------- kitten: head + ears ----------------------
-            if -0.52 < y < 0.20 and -0.40 < x < 0.40:
+            if -0.62 < y < 0.22 and -0.46 < x < 0.46:
                 ax = x if x > 0.0 else -x
                 d = ell(HEAD, x, y, sqrt)
                 de_e = 1e3
@@ -414,16 +428,22 @@ def render():
                                   EAR_C[0], EAR_C[1]) - EAR_R
                     if de_e < d:
                         d = smin(d, de_e, 0.045)
+
+                # soft shadow the head throws behind itself. It only starts a
+                # pixel or two outside the silhouette and then opens out very
+                # slowly, so the edge stays a plain head/background blend --
+                # no hairline hugging the contour, no ring.
+                if 0.0030 < d < 0.072 and y < RIM_Y + 0.01:
+                    a = 0.115 * smoothstep(0.0030, 0.0240, d)
+                    a *= 1.0 - smoothstep(0.0420, 0.0720, d)
+                    a *= 1.0 - smoothstep(RIM_Y - 0.020, RIM_Y + 0.010, y)
+                    if a > 0.002:
+                        cr += (0.330 - cr) * a
+                        cg += (0.500 - cg) * a
+                        cb += (0.450 - cb) * a
+
                 cov = 1.0 - smoothstep(-AA, AA, d)
                 if cov > 0.002:
-                    # soft contact shadow where the fur meets the cup interior
-                    if 0.0 < d < 0.040 and y < RIM_Y + 0.01:
-                        a = 0.30 * (1.0 - smoothstep(0.0, 0.040, d))
-                        a *= 1.0 - smoothstep(RIM_Y - 0.09, RIM_Y + 0.01, y)
-                        if a > 0.002:
-                            cr += (0.330 - cr) * a
-                            cg += (0.500 - cg) * a
-                            cb += (0.450 - cb) * a
                     cov *= 1.0 - smoothstep(RIM_Y + 0.020, RIM_Y + 0.095, y)
                     sh = 0.060 * smoothstep(-0.030, 0.150, y)      # under chin
                     sh += 0.040 * smoothstep(0.130, 0.330, x)      # right side
@@ -513,6 +533,34 @@ def render():
                         cr += (0.876 - cr) * cov
                         cg += (0.734 - cg) * cov
                         cb += (0.436 - cb) * cov
+
+            # ---------------- short arm: head down to the paw ----------
+            if 0.17 < x < 0.33 and 0.02 < y < 0.17:
+                ex = ARM_BX - ARM_AX
+                ey = ARM_BY - ARM_AY
+                vx = x - ARM_AX
+                vy = y - ARM_AY
+                t = (vx * ex + vy * ey) / (ex * ex + ey * ey)
+                if t < 0.0:
+                    t = 0.0
+                elif t > 1.0:
+                    t = 1.0
+                qx = vx - ex * t
+                qy = vy - ey * t
+                d = sqrt(qx * qx + qy * qy) - ARM_R
+                if d < 0.02:
+                    cov = 1.0 - smoothstep(-AA, AA, d)
+                    if cov > 0.002:
+                        # same cream as the head and the paw, with the same
+                        # gentle multiply: the flank turned away from the light
+                        # (the underside of the arm) sits a shade darker, which
+                        # is what gives the limb its wrist line
+                        u = (qx * ARM_NX + qy * ARM_NY) / ARM_R
+                        f = 1.0 - 0.130 * smoothstep(-0.35, 0.80, u)
+                        f -= 0.040 * smoothstep(0.280, 0.380, x)
+                        cr += (0.992 * f - cr) * cov
+                        cg += (0.955 * f - cg) * cov
+                        cb += (0.884 * f - cb) * cov
 
             # ---------------- paw over the rim -------------------------
             if 0.16 < x < 0.48 and -0.06 < y < 0.30:
