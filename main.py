@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Eclipse Moth -- procedural artwork rendered with the Python standard library.
+"""Teacup Nap -- procedural artwork rendered with the Python standard library.
 
-A moth seen from above, wings spread: each wing plate is a total solar eclipse,
-near-black against a blazing golden corona that hugs the wing edge and burns
-brightest at the tips. Deep violet-to-black radial sky, slim dark body, two
-feathery antennae, a little gold dust.
+A tiny round kitten asleep inside a mint-green teacup, seen from the side: a
+big soft cream head with two triangular ears, eyes drawn as two gentle closed
+arcs, a tiny pink nose, blush cheeks and one little paw draped over the rim.
+The cup carries a thin gold rim and a small heart; one thin curl of steam
+rises above it. Warm cream background with a very soft glow behind the cup.
 
 Rendering notes
 ---------------
-* Everything is analytic: signed distance fields for the wing plates, ellipse
-  distance approximations for the body, an exact spine function for antennae.
-  Anti-aliasing comes from a 1-pixel smoothstep on the signed distance, so the
-  edges are clean without any dithering or noise.
-* The piece is mirror-symmetric about the vertical axis, so only the right half
-  (512 columns) is evaluated; the left half is a byte-slice reversal of it.
+* Everything is analytic: signed distance fields for each shape (ellipses,
+  rounded triangles, a heart implicit, a swept teacup silhouette), turned into
+  coverage by a one-pixel smoothstep. No dithering, no noise, no hard lines --
+  every edge is soft by construction, and shading is a gentle multiply.
+* The mug is not symmetric (one handle, one paw, one heart, one curl of
+  steam), so all 1024 columns are evaluated; only the per-row profile of the
+  cup wall and of the steam curl is hoisted out of the pixel loop.
+* Every shape is culled by a bounding box before its distance function runs,
+  which is what keeps a pure-Python renderer inside a few seconds.
 * PNG is emitted by hand: IHDR / IDAT / IEND, RGB8, zlib deflate.
 
 Modules used: math, os, struct, zlib (standard library only).
@@ -26,7 +30,6 @@ import zlib
 
 W = 1024
 H = 1024
-HALF = W // 2
 INV = 2.0 / W          # one distance unit spans W/2 = 512 px
 AA = 0.5 * INV         # half a pixel: total smoothstep width = 1 px
 
@@ -42,14 +45,6 @@ def smoothstep(e0, e1, x):
     if t >= 1.0:
         return 1.0
     return t * t * (3.0 - 2.0 * t)
-
-
-def clamp01(x):
-    if x < 0.0:
-        return 0.0
-    if x > 1.0:
-        return 1.0
-    return x
 
 
 def ell_params(cx, cy, a, b, ang):
@@ -76,7 +71,7 @@ def ell(e, x, y, sqrt=math.sqrt):
 
 
 def smin(a, b, k):
-    """Polynomial smooth minimum -- welds forewing and hindwing together."""
+    """Polynomial smooth minimum -- welds the ears onto the head."""
     h = k - abs(a - b)
     if h <= 0.0:
         return a if a < b else b
@@ -85,31 +80,137 @@ def smin(a, b, k):
     return m - 0.25 * h * h * k
 
 
+def tri_sd(x, y, ax, ay, bx, by, cx, cy):
+    """Signed distance to a triangle (negative inside)."""
+    e0x = bx - ax
+    e0y = by - ay
+    e1x = cx - bx
+    e1y = cy - by
+    e2x = ax - cx
+    e2y = ay - cy
+    v0x = x - ax
+    v0y = y - ay
+    v1x = x - bx
+    v1y = y - by
+    v2x = x - cx
+    v2y = y - cy
+
+    t = (v0x * e0x + v0y * e0y) / (e0x * e0x + e0y * e0y)
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    q0x = v0x - e0x * t
+    q0y = v0y - e0y * t
+
+    t = (v1x * e1x + v1y * e1y) / (e1x * e1x + e1y * e1y)
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    q1x = v1x - e1x * t
+    q1y = v1y - e1y * t
+
+    t = (v2x * e2x + v2y * e2y) / (e2x * e2x + e2y * e2y)
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    q2x = v2x - e2x * t
+    q2y = v2y - e2y * t
+
+    s = e0x * e2y - e0y * e2x
+    s = 1.0 if s >= 0.0 else -1.0
+
+    d0 = q0x * q0x + q0y * q0y
+    d1 = q1x * q1x + q1y * q1y
+    d2 = q2x * q2x + q2y * q2y
+    w0 = s * (v0x * e0y - v0y * e0x)
+    w1 = s * (v1x * e1y - v1y * e1x)
+    w2 = s * (v2x * e2y - v2y * e2x)
+
+    d = d0 if d0 < d1 else d1
+    w = w0 if w0 < w1 else w1
+    if d2 < d:
+        d = d2
+    if w2 < w:
+        w = w2
+    return -math.sqrt(d) if w > 0.0 else math.sqrt(d)
+
+
+def heart_sd(x, y, cx, cy, s):
+    """Approximate distance to a heart curve (negative inside)."""
+    u = (x - cx) / s
+    v = (cy - y) / s
+    q = u * u + v * v - 1.0
+    f = q * q * q - u * u * v * v * v
+    gx = 6.0 * u * q * q - 2.0 * u * v * v * v
+    gy = 6.0 * v * q * q - 3.0 * u * u * v * v
+    g = math.sqrt(gx * gx + gy * gy)
+    if g < 1e-6:
+        return 1e3
+    return f / g * s
+
+
 # --------------------------------------------------------------------------
-# geometry
+# geometry -- teacup seen from the side
 # --------------------------------------------------------------------------
 
-FORE = ell_params(0.430, -0.285, 0.440, 0.225, -0.40)
-HIND = ell_params(0.318, 0.300, 0.360, 0.292, 0.36)
-HEAD = ell_params(0.0, -0.428, 0.033, 0.040, 0.0)
+RIM_Y = 0.075          # rim centre line
+RIM_RX = 0.615
+RIM_RY = 0.100
+BASE_Y = 0.800
+TOP_HW = 0.560
+BOT_HW = 0.360
+RB = 0.120             # bottom rounding (elliptical foot)
+T_B = 1.0 - RB / (BASE_Y - RIM_Y)
 
-# feathery antenna: spine x(t), y(t) with t in [0, 1]
-AX0, AY0 = 0.025, -0.435
-AXS, AYS = 0.372, -0.470
-APOW = 2.10
-TEETH = 9.5
 
-MOTES = (
-    (0.640, -0.760, 0.0055, 0.85),
-    (0.828, -0.318, 0.0042, 0.62),
-    (0.560, 0.640, 0.0050, 0.58),
-    (0.905, 0.104, 0.0034, 0.50),
-    (0.300, -0.885, 0.0032, 0.46),
-    (0.742, 0.452, 0.0040, 0.42),
-    (0.432, -0.700, 0.0028, 0.34),
-    (0.196, 0.812, 0.0036, 0.40),
-    (0.985, -0.620, 0.0028, 0.30),
-)
+def _body_w(t):
+    return TOP_HW + (BOT_HW - TOP_HW) * t + 0.020 * math.sin(math.pi * t)
+
+
+W_B = _body_w(T_B)
+
+
+def cup_hw(y):
+    """Half width of the cup wall at height y (-1 where there is no wall)."""
+    if y < RIM_Y or y >= BASE_Y:
+        return -1.0
+    t = (y - RIM_Y) / (BASE_Y - RIM_Y)
+    if t <= T_B:
+        return _body_w(t)
+    u = (t - T_B) / (1.0 - T_B)
+    return W_B * math.sqrt(1.0 - u * u)
+
+
+RIM = ell_params(0.0, RIM_Y, RIM_RX, RIM_RY, 0.0)
+INNER = ell_params(0.0, RIM_Y, RIM_RX * 0.995, RIM_RY * 0.985, 0.0)
+HANDLE_O = ell_params(0.585, 0.400, 0.170, 0.150, -0.27)
+HANDLE_I = ell_params(0.585, 0.400, 0.088, 0.072, -0.27)
+SAUCER = ell_params(0.0, 0.830, 0.800, 0.105, 0.0)
+SAUCER_EDGE = ell_params(0.0, 0.846, 0.795, 0.100, 0.0)
+WELL = ell_params(0.0, 0.820, 0.700, 0.078, 0.0)
+SHADOW = ell_params(0.0, 0.872, 0.860, 0.095, 0.0)
+HEAD = ell_params(0.0, -0.055, 0.340, 0.300, 0.0)
+PAW = ell_params(0.320, 0.115, 0.100, 0.125, 0.20)
+FOOT_SH = ell_params(0.0, 0.818, 0.470, 0.058, 0.0)
+
+# right ear, a rounded triangle; the left one is the mirror image
+EAR_A = (0.060, -0.260)
+EAR_B = (0.330, -0.215)
+EAR_C = (0.300, -0.470)
+EAR_R = 0.030
+# inner ear: the same triangle shrunk about its centroid
+IN_A = (0.126, -0.283)
+IN_B = (0.303, -0.249)
+IN_C = (0.275, -0.410)
+IN_R = 0.020
+
+EYE_X = 0.125
+EYE_Y = -0.120
+EYE_HW = 0.062
+EYE_BOW = 0.030
+
+NOSEY = -0.035
+CHEEK = ell_params(0.215, -0.055, 0.089, 0.056, 0.0)
+HEART_X = -0.245
+HEART_Y = 0.430
+HEART_S = 0.088
+ST_TAU = math.pi * 1.2       # one slow curl, not a zig-zag
+STEAM_Y0 = 0.125             # the wisp starts inside the cup opening
+STEAM_Y1 = -0.870
 
 
 # --------------------------------------------------------------------------
@@ -119,157 +220,352 @@ MOTES = (
 def render():
     exp = math.exp
     sqrt = math.sqrt
+    sin = math.sin
+    cos = math.cos
     fabs = math.fabs
     pi = math.pi
 
     rows = []
     for j in range(H):
         y = (j + 0.5) * INV - 1.0
-        rh = bytearray(HALF * 3)
+
+        # ---- per-row cup wall -------------------------------------------
+        hw = cup_hw(y)
+        body_on = hw > 0.0
+        rim_sh = 0.0
+        if body_on:
+            dy = y - RIM_Y
+            rim_sh = 0.26 * exp(-(dy / 0.115) ** 2)
+        bot_sh = 0.0
+        if y > BASE_Y - 0.16:
+            bot_sh = 0.14 * smoothstep(BASE_Y - 0.16, BASE_Y - 0.01, y)
+
+        # ---- per-row steam curl -----------------------------------------
+        st_on = -0.95 < y < 0.14
+        st_xc = 0.0
+        st_nrm = 1.0
+        st_w = 0.01
+        st_env = 0.0
+        if st_on:
+            t = (STEAM_Y0 - y) / (STEAM_Y0 - STEAM_Y1)
+            if 0.0 <= t <= 1.0:
+                u = (t - 0.40) / 0.60
+                if u < 0.0:
+                    u = 0.0
+                elif u > 1.0:
+                    u = 1.0
+                sw = 8.1681 * t                      # 2*pi*1.3
+                st_xc = -0.465 + 0.300 * u * u + 0.018 * sin(sw)
+                dxdt = u + 0.1470 * cos(sw)
+                slope = dxdt / (STEAM_Y0 - STEAM_Y1)
+                st_nrm = 1.0 / sqrt(1.0 + slope * slope)
+                st_w = 0.0150 * (1.0 - 0.55 * t)
+                st_env = 0.74 * smoothstep(0.0, 0.20, t) * \
+                    (1.0 - smoothstep(0.76, 1.0, t))
+                if st_env < 0.004:
+                    st_on = False
+            else:
+                st_on = False
+
+        row = bytearray(W * 3)
         p = 0
 
-        # ---- per-row body profile -------------------------------------
-        s = (y + 0.44) / 1.06
-        body_on = -0.02 < s < 1.06
-        bw = 0.0
-        if body_on:
-            bw = 0.021
-            bw += 0.038 * exp(-((s - 0.090) / 0.130) ** 2)
-            bw += 0.022 * exp(-((s - 0.420) / 0.300) ** 2)
-            bw *= 1.0 - smoothstep(0.76, 1.00, s)
-            bw *= smoothstep(-0.02, 0.015, s)
-            if bw < 0.0:
-                bw = 0.0
+        for i in range(W):
+            x = (i + 0.5) * INV - 1.0
 
-        for i in range(HALF):
-            x = (i + 0.5) * INV
-
-            # ---------------- sky: deep violet -> near black -----------
+            # ---------------- warm cream background + soft glow --------
             r2 = x * x + y * y
-            t = r2 * 0.60
-            if t > 1.0:
-                t = 1.0
-            tt = t * t * (3.0 - 2.0 * t)
-            r = sqrt(r2)
+            gl = exp(-r2 * 1.55)
+            cr = 0.9640 + 0.0300 * gl
+            cg = 0.9200 + 0.0320 * gl
+            cb = 0.8560 + 0.0400 * gl
+            vg = 0.032 * smoothstep(0.55, 1.30, sqrt(r2))
+            cr -= vg
+            cg -= vg * 0.94
+            cb -= vg * 0.86
 
-            cr = 0.108 * (1.0 - tt) + 0.011 * tt
-            cg = 0.046 * (1.0 - tt) + 0.007 * tt
-            cb = 0.196 * (1.0 - tt) + 0.022 * tt
+            # ---------------- saucer -----------------------------------
+            if y > 0.66 and -0.90 < x < 0.90:
+                d = ell(SHADOW, x, y, sqrt)
+                if d < 0.30:
+                    a = 0.17 * (1.0 - smoothstep(-0.14, 0.26, d))
+                    cr += (0.796 - cr) * a
+                    cg += (0.742 - cg) * a
+                    cb += (0.672 - cb) * a
 
-            # faint violet halo where the corona bleeds into the dark
-            hz = 0.042 * exp(-((r - 0.70) / 0.34) ** 2)
-            cr += hz * 0.95
-            cg += hz * 0.42
-            cb += hz * 1.25
+                d = ell(SAUCER_EDGE, x, y, sqrt)
+                if d < 0.02:
+                    cov = 1.0 - smoothstep(-AA, AA, d)
+                    cr += (0.792 - cr) * cov
+                    cg += (0.878 - cg) * cov
+                    cb += (0.850 - cb) * cov
 
-            # ---------------- wing plate -------------------------------
-            d = smin(ell(FORE, x, y, sqrt), ell(HIND, x, y, sqrt), 0.100)
-            cov = 1.0 - smoothstep(-AA, AA, d)
+                d = ell(SAUCER, x, y, sqrt)
+                if d < 0.02:
+                    cov = 1.0 - smoothstep(-AA, AA, d)
+                    # shallow well in the middle
+                    d2 = ell(WELL, x, y, sqrt)
+                    wl = 1.0 - smoothstep(-0.030, 0.030, d2)
+                    sr = 0.844 - 0.058 * wl
+                    sg = 0.918 - 0.050 * wl
+                    sb = 0.882 - 0.054 * wl
+                    # darker outer edge -> saucer thickness
+                    ed = smoothstep(-0.060, 0.000, d)
+                    sr -= 0.072 * ed
+                    sg -= 0.064 * ed
+                    sb -= 0.058 * ed
+                    cr += (sr - cr) * cov
+                    cg += (sg - cg) * cov
+                    cb += (sb - cb) * cov
 
-            # ---------------- corona outside the edge ------------------
-            if cov < 0.999:
-                dn = d if d > 0.0 else 0.0
-                if dn < 0.42:
-                    k = (r - 0.15) * 1.34
-                    if k < 0.0:
-                        k = 0.0
-                    elif k > 1.0:
-                        k = 1.0
-                    tipw = 0.30 + 0.98 * (k ** 1.45)
+            # ---------------- cup handle (right, behind the wall) ------
+            if 0.14 < y < 0.66 and x > 0.44:
+                d = ell(HANDLE_O, x, y, sqrt)
+                if d < 0.03:
+                    di = ell(HANDLE_I, x, y, sqrt)
+                    dd = d if d > -di else -di
+                    cov = 1.0 - smoothstep(-AA, AA, dd)
+                    if cov > 0.002:
+                        f = 1.0
+                        f -= 0.16 * smoothstep(0.30, 0.72, y)
+                        f -= 0.13 * smoothstep(0.58, 0.84, x)
+                        f -= 0.10 * (1.0 - smoothstep(0.475, 0.560, x))
+                        f += 0.05 * exp(-((y - 0.290) / 0.150) ** 2) * \
+                            exp(-((x - 0.560) / 0.120) ** 2)
+                        hr = 0.618 * f
+                        hg = 0.858 * f
+                        hb = 0.762 * f
+                        cr += (hr - cr) * cov
+                        cg += (hg - cg) * cov
+                        cb += (hb - cb) * cov
 
-                    core = exp(-((dn - 0.0085) * 62.0) ** 2)
-                    mid = exp(-dn * 17.0)
-                    far = exp(-dn * 5.5)
-                    g = tipw * (1.02 * core + 0.50 * mid + 0.15 * far)
-                    g *= (1.0 - cov)
-                    if g > 0.001:
-                        gi = g if g < 1.0 else 1.0
-                        cr += (1.00 - 0.02 * gi) * g
-                        cg += (0.80 + 0.20 * gi) * g
-                        cb += (0.50 + 0.46 * gi) * g
+            # ---------------- inside of the cup ------------------------
+            if y < RIM_Y + RIM_RY + 0.01 and -0.63 < x < 0.63:
+                d = ell(INNER, x, y, sqrt)
+                if d < 0.01:
+                    cov = 1.0 - smoothstep(-AA, AA, d)
+                    k = smoothstep(RIM_Y - RIM_RY, RIM_Y + RIM_RY, y)
+                    ir = 0.404 + 0.030 * k
+                    ig = 0.612 + 0.034 * k
+                    ib = 0.548 + 0.030 * k
+                    cr += (ir - cr) * cov
+                    cg += (ig - cg) * cov
+                    cb += (ib - cb) * cov
 
-            # ---------------- wing plate fill + inner rim -------------
-            if cov > 0.001:
-                din = -d
-                bleed = exp(-(din if din > 0.0 else 0.0) * 15.0)
-                pr = 0.030 + bleed * 0.46
-                pg = 0.024 + bleed * 0.33
-                pb = 0.052 + bleed * 0.13
-                cr = cr * (1.0 - cov) + pr * cov
-                cg = cg * (1.0 - cov) + pg * cov
-                cb = cb * (1.0 - cov) + pb * cov
+            # ---------------- contact shadow on the saucer -------------
+            if 0.70 < y < 0.92 and -0.52 < x < 0.52:
+                d = ell(FOOT_SH, x, y, sqrt)
+                if d < 0.06:
+                    a = 0.34 * (1.0 - smoothstep(-0.020, 0.055, d))
+                    if a > 0.002:
+                        cr += (0.452 - cr) * a
+                        cg += (0.628 - cg) * a
+                        cb += (0.542 - cb) * a
 
-                inn = exp(-((din - 0.0060) * 85.0) ** 2)
-                if inn > 0.002:
-                    kk = (r - 0.15) * 1.34
-                    if kk < 0.0:
-                        kk = 0.0
-                    elif kk > 1.0:
-                        kk = 1.0
-                    rw = (0.42 + 0.72 * kk) * inn * cov
-                    cr += 1.00 * rw
-                    cg += 0.88 * rw
-                    cb += 0.62 * rw
+            # ---------------- cup wall ---------------------------------
+            if body_on and -hw - 0.02 < x < hw + 0.02:
+                e = x - hw
+                cov = 1.0 - smoothstep(-AA, AA, e)
+                cov *= smoothstep(RIM_Y - AA, RIM_Y + AA, y)
+                if cov > 0.002:
+                    f = 1.0
+                    f -= rim_sh                                  # cast by rim
+                    f -= 0.13 * smoothstep(0.02, 0.52, x)        # right shade
+                    f -= 0.11 * (1.0 - smoothstep(-0.075, 0.0, e))
+                    f -= 0.11 * (1.0 - smoothstep(-0.075, 0.0, -hw - x))
+                    f += 0.075 * exp(-((x + 0.210) / 0.230) ** 2) * \
+                        (1.0 - smoothstep(0.18, 0.62, y))
+                    f -= bot_sh
+                    mr = 0.618 * f
+                    mg = 0.858 * f
+                    mb = 0.762 * f
+                    cr += (mr - cr) * cov
+                    cg += (mg - cg) * cov
+                    cb += (mb - cb) * cov
 
-            # ---------------- slim body + rounded head -----------------
-            hb = 1e3
-            if -0.505 < y < -0.345:
-                hb = ell(HEAD, x, y, sqrt)
-            if (body_on and bw > 0.0005) or hb < 0.4:
-                db = fabs(x) - bw if bw > 0.0005 else 1e3
-                if hb < 0.4:
-                    db = smin(db, hb, 0.020)
-                covb = 1.0 - smoothstep(-AA, AA, db)
-                if covb > 0.002:
-                    br = 0.040
-                    bg_ = 0.030
-                    bb = 0.058
-                    cr = cr * (1.0 - covb) + br * covb
-                    cg = cg * (1.0 - covb) + bg_ * covb
-                    cb = cb * (1.0 - covb) + bb * covb
-                    rim = exp(-((db + 0.0016) * 300.0) ** 2)
-                    rim *= 0.55 * covb
-                    cr += 1.00 * rim
-                    cg += 0.84 * rim
-                    cb += 0.58 * rim
+            # ---------------- little heart on the cup ------------------
+            if -0.36 < x < -0.13 and 0.30 < y < 0.58:
+                d = heart_sd(x, y, HEART_X, HEART_Y, HEART_S)
+                if d < 0.02:
+                    cov = 1.0 - smoothstep(-AA, AA * 2.0, d)
+                    f = 1.0 - 0.055 * smoothstep(-0.05, 0.06, y - HEART_Y)
+                    cr += (0.964 * f - cr) * cov
+                    cg += (0.688 * f - cg) * cov
+                    cb += (0.724 * f - cb) * cov
 
-            # ---------------- feathery antenna --------------------------
-            if y < -0.425 and x < 0.470:
-                ta = -(y - AY0) / (-AYS)
-                if 0.0 <= ta < 1.04:
-                    xsp = AX0 + AXS * (ta ** APOW)
-                    perp = fabs(x - xsp)
-                    if perp < 0.075:
-                        slope = (AXS * APOW * (ta ** 0.6 if ta > 1e-6 else 0.0)) / (-AYS)
-                        perp = perp / sqrt(1.0 + slope * slope)
-                        ts = clamp01(ta)
-                        wave = math.sin(pi * ts)
-                        spine = exp(-(perp / (0.0040 + 0.0018 * wave)) ** 2)
-                        fe = 0.009 + 0.015 * wave * wave
-                        rib = 0.40 * exp(-(perp / fe) ** 2)
-                        rib *= 0.58 + 0.42 * math.cos(2.0 * pi * TEETH * ts)
-                        a = spine + rib * wave * 0.85 + 0.12 * exp(-(perp / 0.014) ** 2)
-                        if a > 0.003:
-                            if a > 1.0:
-                                a = 1.0
-                            cr += 1.00 * a
-                            cg += 0.93 * a
-                            cb += 0.76 * a
+            # ---------------- gold rim (whole ellipse) -----------------
+            if y < RIM_Y + RIM_RY + 0.02 and -0.63 < x < 0.63:
+                d = ell(RIM, x, y, sqrt)
+                if -0.02 < d < 0.02:
+                    band = d if d > 0.0 else -d
+                    cov = 1.0 - smoothstep(0.0040, 0.0072, band)
+                    if cov > 0.002:
+                        cr += (0.876 - cr) * cov
+                        cg += (0.734 - cg) * cov
+                        cb += (0.436 - cb) * cov
 
-            # ---------------- gold dust ---------------------------------
-            for mx, my, mr, ma in MOTES:
-                ddx = x - mx
-                if ddx > 0.03 or ddx < -0.03:
-                    continue
-                ddy = y - my
-                dd = (ddx * ddx + ddy * ddy) / (mr * mr)
-                if dd < 9.0:
-                    a = ma * exp(-dd * 1.8)
-                    cr += 1.00 * a
-                    cg += 0.87 * a
-                    cb += 0.55 * a
+            # ---------------- kitten: head + ears ----------------------
+            if -0.52 < y < 0.20 and -0.40 < x < 0.40:
+                ax = x if x > 0.0 else -x
+                d = ell(HEAD, x, y, sqrt)
+                de_e = 1e3
+                if -0.51 < y < -0.18 and 0.02 < ax < 0.40:
+                    de_e = tri_sd(ax, y, EAR_A[0], EAR_A[1], EAR_B[0], EAR_B[1],
+                                  EAR_C[0], EAR_C[1]) - EAR_R
+                    if de_e < d:
+                        d = smin(d, de_e, 0.045)
+                cov = 1.0 - smoothstep(-AA, AA, d)
+                if cov > 0.002:
+                    # soft contact shadow where the fur meets the cup interior
+                    if 0.0 < d < 0.040 and y < RIM_Y + 0.01:
+                        a = 0.30 * (1.0 - smoothstep(0.0, 0.040, d))
+                        a *= 1.0 - smoothstep(RIM_Y - 0.09, RIM_Y + 0.01, y)
+                        if a > 0.002:
+                            cr += (0.330 - cr) * a
+                            cg += (0.500 - cg) * a
+                            cb += (0.450 - cb) * a
+                    cov *= 1.0 - smoothstep(RIM_Y + 0.020, RIM_Y + 0.095, y)
+                    sh = 0.060 * smoothstep(-0.030, 0.150, y)      # under chin
+                    sh += 0.040 * smoothstep(0.130, 0.330, x)      # right side
+                    sh -= 0.020 * exp(-((y + 0.190) / 0.190) ** 2) * \
+                        exp(-((x - 0.010) / 0.230) ** 2)           # forehead
+                    f = 1.0 - sh
+                    cr += (0.992 * f - cr) * cov
+                    cg += (0.955 * f - cg) * cov
+                    cb += (0.884 * f - cb) * cov
 
-            # ---------------- write -------------------------------------
+                    # inner ear, soft blush
+                    if -0.44 < y < -0.20 and 0.08 < ax < 0.33:
+                        de = tri_sd(ax, y, IN_A[0], IN_A[1], IN_B[0], IN_B[1],
+                                    IN_C[0], IN_C[1]) - IN_R
+                        if de < 0.03:
+                            cv = 1.0 - smoothstep(-0.010, 0.012, de)
+                            cv *= cov * 0.62
+                            cv *= 1.0 - smoothstep(-0.004, 0.004, de_e)
+                            cr += (0.962 - cr) * cv
+                            cg += (0.706 - cg) * cv
+                            cb += (0.742 - cb) * cv
+
+            # ---------------- face -------------------------------------
+            if -0.20 < y < 0.06 and -0.32 < x < 0.32:
+                dh = ell(HEAD, x, y, sqrt)
+                if dh < 0.0:
+                    ax = x if x > 0.0 else -x
+                    # closed eye: a gentle arc bowing upwards
+                    u = (ax - EYE_X) / EYE_HW
+                    if -1.10 < u < 1.10:
+                        uu = u if u < 1.0 else 1.0
+                        uu = uu if uu > -1.0 else -1.0
+                        ya = EYE_Y - EYE_BOW * (1.0 - uu * uu)
+                        sl = 2.0 * EYE_BOW * uu / EYE_HW
+                        dd = fabs(y - ya) / sqrt(1.0 + sl * sl)
+                        if dd < 0.020:
+                            a = 1.0 - smoothstep(0.0052, 0.0128, dd)
+                            a *= 1.0 - smoothstep(0.72, 1.02, fabs(u))
+                            a *= 0.94
+                            cr += (0.452 - cr) * a
+                            cg += (0.372 - cg) * a
+                            cb += (0.336 - cb) * a
+
+                    # tiny nose (rounded triangle pointing down)
+                    if -0.075 < x < 0.075 and -0.07 < y < 0.0:
+                        dn = tri_sd(x, y, 0.0, NOSEY - 0.018,
+                                    0.021, NOSEY + 0.010,
+                                    -0.021, NOSEY + 0.010) - 0.007
+                        if dn < 0.02:
+                            a = 1.0 - smoothstep(-0.006, 0.009, dn)
+                            if a > 0.004:
+                                cr += (0.938 - cr) * a
+                                cg += (0.605 - cg) * a
+                                cb += (0.652 - cb) * a
+
+                    # small "w" mouth, very soft, symmetric
+                    if ax < 0.030 and 0.000 < y < 0.045:
+                        u = ax / 0.026
+                        if u < 1.02:
+                            ym = 0.021 - 0.007 * cos(pi * u * 2.0)
+                            sl = 0.007 * 2.0 * pi / 0.026 * sin(pi * u * 2.0)
+                            dd = fabs(y - ym) / sqrt(1.0 + sl * sl)
+                            a = (1.0 - smoothstep(0.0038, 0.0092, dd)) * 0.50
+                            a *= 1.0 - smoothstep(0.80, 1.02, u)
+                            if a > 0.003:
+                                cr += (0.585 - cr) * a
+                                cg += (0.470 - cg) * a
+                                cb += (0.428 - cb) * a
+
+                    # blush cheek
+                    dc = ell(CHEEK, ax, y, sqrt)
+                    if dc < 0.06:
+                        a = 0.44 * (1.0 - smoothstep(-0.030, 0.030, dc))
+                        if a > 0.002:
+                            cr += (0.968 - cr) * a
+                            cg += (0.686 - cg) * a
+                            cb += (0.726 - cb) * a
+
+            # ---------------- gold rim, front half (over the kitten) ---
+            if RIM_Y - 0.01 < y < RIM_Y + RIM_RY + 0.02 and -0.63 < x < 0.63:
+                d = ell(RIM, x, y, sqrt)
+                if -0.02 < d < 0.02:
+                    band = d if d > 0.0 else -d
+                    cov = 1.0 - smoothstep(0.0040, 0.0072, band)
+                    cov *= smoothstep(RIM_Y - 0.004, RIM_Y + 0.004, y)
+                    if cov > 0.002:
+                        cr += (0.876 - cr) * cov
+                        cg += (0.734 - cg) * cov
+                        cb += (0.436 - cb) * cov
+
+            # ---------------- paw over the rim -------------------------
+            if 0.16 < x < 0.48 and -0.06 < y < 0.30:
+                d = ell(PAW, x, y, sqrt)
+                if d < 0.042:
+                    a = 0.13 * (1.0 - smoothstep(-0.030, 0.040, d))
+                    if a > 0.002:
+                        cr += (0.762 - cr) * a
+                        cg += (0.688 - cg) * a
+                        cb += (0.628 - cb) * a
+                if d < 0.02:
+                    cov = 1.0 - smoothstep(-AA, AA, d)
+                    f = 1.0 - 0.085 * smoothstep(0.02, 0.22, y)
+                    f -= 0.055 * smoothstep(0.34, 0.46, x)
+                    f += 0.025 * exp(-((x - 0.278) / 0.075) ** 2) * \
+                        (1.0 - smoothstep(-0.01, 0.07, y))
+                    pr = 0.992 * f
+                    pg = 0.955 * f
+                    pb = 0.884 * f
+                    cr += (pr - cr) * cov
+                    cg += (pg - cg) * cov
+                    cb += (pb - cb) * cov
+
+                    # three soft toe creases + a light shadow under the paw
+                    if 0.140 < y < 0.250 and cov > 0.4:
+                        for xt in (0.258, 0.322, 0.386):
+                            dx = x - xt
+                            if -0.013 < dx < 0.013:
+                                a = 1.0 - smoothstep(0.0030, 0.0098,
+                                                     dx if dx > 0 else -dx)
+                                a *= smoothstep(0.140, 0.170, y) * \
+                                    (1.0 - smoothstep(0.210, 0.245, y))
+                                a *= 0.85
+                                if a > 0.002:
+                                    cr -= 0.110 * a
+                                    cg -= 0.126 * a
+                                    cb -= 0.134 * a
+
+            # ---------------- one thin curl of steam -------------------
+            if st_on:
+                d = (x - st_xc) * st_nrm
+                if d < 0.0:
+                    d = -d
+                if d < st_w * 3.2:
+                    a = (1.0 - smoothstep(0.0, st_w, d)) * 0.94
+                    a += 0.20 * (1.0 - smoothstep(st_w, st_w * 3.0, d))
+                    a *= st_env
+                    if a > 0.004:
+                        cr += (0.991 - cr) * a
+                        cg += (0.986 - cg) * a
+                        cb += (0.973 - cb) * a
+
+            # ---------------- write ------------------------------------
             rv = int(cr * 255.0 + 0.5)
             gv = int(cg * 255.0 + 0.5)
             bv = int(cb * 255.0 + 0.5)
@@ -285,17 +581,12 @@ def render():
                 bv = 255
             elif bv < 0:
                 bv = 0
-            rh[p] = rv
-            rh[p + 1] = gv
-            rh[p + 2] = bv
+            row[p] = rv
+            row[p + 1] = gv
+            row[p + 2] = bv
             p += 3
 
-        # mirror the right half into the left half (byte-slice reversal)
-        lh = bytearray(HALF * 3)
-        lh[0::3] = rh[0::3][::-1]
-        lh[1::3] = rh[1::3][::-1]
-        lh[2::3] = rh[2::3][::-1]
-        rows.append(b"\x00" + bytes(lh) + bytes(rh))
+        rows.append(b"\x00" + bytes(row))
 
     return rows
 
