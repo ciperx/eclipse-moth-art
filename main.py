@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
-"""Eclipse Moth -- procedural artwork rendered with the Python standard library.
+"""Papercut Lighthouse -- layered paper cut-out art, Python standard library only.
 
-A moth seen from above, wings spread: each wing plate is a total solar eclipse,
-near-black against a blazing golden corona that hugs the wing edge and burns
-brightest at the tips. Deep violet-to-black radial sky, slim dark body, two
-feathery antennae, a little gold dust.
+Eight flat paper plates, painted far to near, each a solid fill laid over a
+soft 20% drop shadow nudged (4, 6) down-right, so the picture reads as card
+stacked in real depth:
+
+    1  night sky (deep navy) with punched cream stars
+    2  low moon, pale cream disc
+    3  the beam: one wide translucent pale-gold paper wedge, apex at the lantern
+    4  far sea band, dark teal, scalloped paper crest
+    5  mid sea band
+    6  near sea band
+    7  pale cliff on the right
+    8  lighthouse: white tower, two dark paper rings, warm-yellow lantern room
 
 Rendering notes
 ---------------
-* Everything is analytic: signed distance fields for the wing plates, ellipse
-  distance approximations for the body, an exact spine function for antennae.
-  Anti-aliasing comes from a 1-pixel smoothstep on the signed distance, so the
-  edges are clean without any dithering or noise.
-* The piece is mirror-symmetric about the vertical axis, so only the right half
-  (512 columns) is evaluated; the left half is a byte-slice reversal of it.
-* PNG is emitted by hand: IHDR / IDAT / IEND, RGB8, zlib deflate.
+* No textures, no noise, no dithering: every layer is one flat colour, and the
+  only gradient in the piece lives inside the beam.
+* Shapes are drawn as row spans (steep edges: tower, moon, stars) or column
+  spans (shallow edges: sea crests, cliff, beam). Coverage on the spanning axis
+  is analytic -- the exact overlap of the 1px pixel box with the span -- so cut
+  edges land on clean, even anti-aliased boundaries at 1024.
+* Drop shadows are a 7px soft halo around each plate's silhouette, displaced
+  (4, 6): a straight offset alone would vanish under plates whose body runs off
+  the bottom of the frame, the halo keeps a visible rim all the way round and
+  reads heaviest on the lower-right side, as paper lit from the upper left.
+* Full-coverage interiors are written with byte-slice assignment and shadows
+  with bytes.translate against a 20%-darken table, so only the edges and the
+  halo cost real per-pixel work.
+* PNG is assembled by hand: IHDR / IDAT / IEND, RGB8, zlib deflate.
 
-Modules used: math, os, struct, zlib (standard library only).
+Modules used: math, os, struct, zlib.
 """
 
 import math
@@ -24,310 +39,545 @@ import os
 import struct
 import zlib
 
-W = 1024
-H = 1024
-HALF = W // 2
-INV = 2.0 / W          # one distance unit spans W/2 = 512 px
-AA = 0.5 * INV         # half a pixel: total smoothstep width = 1 px
+W = H = 1024
+ROW = W * 3
+NPX = W * H
+
+# ---------------------------------------------------------------------------
+# palette -- one flat colour per paper plate
+# ---------------------------------------------------------------------------
+SKY      = (13, 27, 52)
+STAR     = (247, 239, 214)
+MOON     = (243, 231, 196)
+BEAM     = (255, 226, 132)
+SEA_FAR  = (30, 82, 94)
+SEA_MID  = (21, 62, 74)
+SEA_NEAR = (14, 44, 55)
+CLIFF    = (203, 197, 180)
+LH_WHITE = (246, 243, 233)
+LH_DARK  = (34, 37, 48)
+LANTERN  = (255, 202, 82)
+
+# 20% darken, for drop shadows
+DARK_TBL = bytes(min(255, int(v * 0.8)) for v in range(256))
+
+DX, DY, RB = 4.0, 6.0, 10.0    # shadow offset and halo radius
+
+buf = bytearray(bytes(SKY) * NPX)
 
 
-# --------------------------------------------------------------------------
-# small helpers
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# span maths
+# ---------------------------------------------------------------------------
+def cuts(a, b, n):
+    """Split span [a, b) inside [0, n) into (edge pixels, interior run).
 
-def smoothstep(e0, e1, x):
-    t = (x - e0) / (e1 - e0)
-    if t <= 0.0:
-        return 0.0
-    if t >= 1.0:
-        return 1.0
-    return t * t * (3.0 - 2.0 * t)
-
-
-def clamp01(x):
-    if x < 0.0:
-        return 0.0
-    if x > 1.0:
-        return 1.0
-    return x
-
-
-def ell_params(cx, cy, a, b, ang):
-    """Pre-computed rotated-ellipse distance parameters."""
-    ca = math.cos(ang)
-    sa = math.sin(ang)
-    return (cx, cy, ca, sa, 1.0 / a, 1.0 / b,
-            1.0 / (a * a), 1.0 / (b * b))
-
-
-def ell(e, x, y, sqrt=math.sqrt):
-    """Approximate signed distance to a rotated ellipse (negative inside)."""
-    dx = x - e[0]
-    dy = y - e[1]
-    ca = e[2]
-    sa = e[3]
-    u = dx * ca + dy * sa
-    v = dy * ca - dx * sa
-    k0 = sqrt((u * e[4]) ** 2 + (v * e[5]) ** 2)
-    k1 = sqrt((u * e[6]) ** 2 + (v * e[7]) ** 2)
-    if k1 == 0.0:
-        return -1e3
-    return k0 * (k0 - 1.0) / k1
+    Returns (parts, mid): parts = [(pixel, coverage), ...] for the at most two
+    partially covered end pixels, mid = (i0, i1) for the fully covered interior.
+    None when the span misses the canvas entirely.
+    """
+    if a < 0.0:
+        a = 0.0
+    if b > n:
+        b = float(n)
+    if b <= a:
+        return None
+    ia = int(a)
+    ib = int(b)
+    parts = []
+    mid = None
+    if ib > ia:
+        if a > ia:
+            parts.append((ia, ia + 1.0 - a))
+            ia += 1
+        if b > ib:
+            parts.append((ib, b - ib))
+        if ia < ib:
+            mid = (ia, ib)
+    else:
+        parts.append((ia, b - a))
+    return parts, mid
 
 
-def smin(a, b, k):
-    """Polynomial smooth minimum -- welds forewing and hindwing together."""
-    h = k - abs(a - b)
-    if h <= 0.0:
-        return a if a < b else b
-    h = h / k
-    m = a if a < b else b
-    return m - 0.25 * h * h * k
+def _ramp(c, lo, hi, r):
+    """Soft shoulder: 0 at lo, 1 from lo + r, and mirrored at the hi end."""
+    a = (c - lo) / r
+    if a > 1.0:
+        a = 1.0
+    b = (hi - c) / r
+    if b > 1.0:
+        b = 1.0
+    return a if a < b else b
 
 
-# --------------------------------------------------------------------------
-# geometry
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# span writers
+# ---------------------------------------------------------------------------
+def fill_rows(y0, y1, fxa, fxb, col, alpha=1.0):
+    """Paint the horizontal span [fxa(y), fxb(y)) on every row of [y0, y1)."""
+    r, g, b = col
+    for y in range(max(0, y0), min(H, y1)):
+        res = cuts(fxa(y), fxb(y), W)
+        if res is None:
+            continue
+        parts, mid = res
+        o0 = y * ROW
+        for i, c in parts:
+            o = o0 + i * 3
+            a = alpha * c
+            ia = 1.0 - a
+            buf[o] = int(buf[o] * ia + r * a + 0.5)
+            buf[o + 1] = int(buf[o + 1] * ia + g * a + 0.5)
+            buf[o + 2] = int(buf[o + 2] * ia + b * a + 0.5)
+        if mid:
+            oa = o0 + mid[0] * 3
+            ob = o0 + mid[1] * 3
+            if alpha >= 1.0:
+                buf[oa:ob] = bytes(col) * ((ob - oa) // 3)
+            else:
+                ia = 1.0 - alpha
+                for o in range(oa, ob, 3):
+                    buf[o] = int(buf[o] * ia + r * alpha + 0.5)
+                    buf[o + 1] = int(buf[o + 1] * ia + g * alpha + 0.5)
+                    buf[o + 2] = int(buf[o + 2] * ia + b * alpha + 0.5)
 
-FORE = ell_params(0.430, -0.285, 0.440, 0.225, -0.40)
-HIND = ell_params(0.318, 0.300, 0.360, 0.292, 0.36)
-HEAD = ell_params(0.0, -0.428, 0.033, 0.040, 0.0)
 
-# feathery antenna: spine x(t), y(t) with t in [0, 1]
-AX0, AY0 = 0.025, -0.435
-AXS, AYS = 0.372, -0.470
-APOW = 2.10
-TEETH = 9.5
+def fill_cols(x0, x1, fya, fyb, col, alpha=1.0):
+    """Paint the vertical span [fya(x), fyb(x)) on every column of [x0, x1)."""
+    r, g, b = col
+    for x in range(max(0, x0), min(W, x1)):
+        res = cuts(fya(x), fyb(x), H)
+        if res is None:
+            continue
+        parts, mid = res
+        base = x * 3
+        for i, c in parts:
+            o = i * ROW + base
+            a = alpha * c
+            ia = 1.0 - a
+            buf[o] = int(buf[o] * ia + r * a + 0.5)
+            buf[o + 1] = int(buf[o + 1] * ia + g * a + 0.5)
+            buf[o + 2] = int(buf[o + 2] * ia + b * a + 0.5)
+        if mid:
+            if alpha >= 1.0:
+                for i in range(mid[0], mid[1]):
+                    o = i * ROW + base
+                    buf[o] = r
+                    buf[o + 1] = g
+                    buf[o + 2] = b
+            else:
+                ia = 1.0 - alpha
+                for i in range(mid[0], mid[1]):
+                    o = i * ROW + base
+                    buf[o] = int(buf[o] * ia + r * alpha + 0.5)
+                    buf[o + 1] = int(buf[o + 1] * ia + g * alpha + 0.5)
+                    buf[o + 2] = int(buf[o + 2] * ia + b * alpha + 0.5)
 
-MOTES = (
-    (0.640, -0.760, 0.0055, 0.85),
-    (0.828, -0.318, 0.0042, 0.62),
-    (0.560, 0.640, 0.0050, 0.58),
-    (0.905, 0.104, 0.0034, 0.50),
-    (0.300, -0.885, 0.0032, 0.46),
-    (0.742, 0.452, 0.0040, 0.42),
-    (0.432, -0.700, 0.0028, 0.34),
-    (0.196, 0.812, 0.0036, 0.40),
-    (0.985, -0.620, 0.0028, 0.30),
+
+def shadow_rows(y0, y1, fxa, fxb):
+    """Soft 20% drop shadow for a row-span plate, halo radius RB, offset (4, 6)."""
+    top = y0 + DY - RB
+    bot = y1 + DY + RB
+    for y in range(int(math.floor(top)), int(math.ceil(bot))):
+        if y < 0 or y >= H:
+            continue
+        c = y + 0.5
+        if c < y0 + DY:
+            t = (c - top) / RB
+        elif c <= y1 + DY:
+            t = 1.0
+        else:
+            t = (bot - c) / RB
+        if t <= 0.0:
+            continue
+        if t > 1.0:
+            t = 1.0
+        yy = y - DY
+        if yy < y0:
+            yy = y0
+        elif yy > y1 - 1e-6:
+            yy = y1 - 1e-6
+        xa = fxa(yy) + DX - RB
+        xb = fxb(yy) + DX + RB
+        ia = int(xa) if xa > 0.0 else 0
+        ib = int(math.ceil(xb))
+        if ib > W:
+            ib = W
+        if ib <= ia:
+            continue
+        o0 = y * ROW
+        full = t >= 1.0
+        if full:
+            r0 = ia + int(RB) + 1
+            r1 = ib - int(RB) - 1
+            if r1 > r0:
+                oa = o0 + r0 * 3
+                ob = o0 + r1 * 3
+                buf[oa:ob] = buf[oa:ob].translate(DARK_TBL)
+                segs = ((ia, r0), (r1, ib))
+            else:
+                segs = ((ia, ib),)
+        else:
+            segs = ((ia, ib),)
+        for s0, s1 in segs:
+            for i in range(s0, s1):
+                k = t * _ramp(i + 0.5, xa, xb, RB)
+                if k <= 0.0:
+                    continue
+                f = 1.0 - 0.2 * k
+                o = o0 + i * 3
+                buf[o] = int(buf[o] * f)
+                buf[o + 1] = int(buf[o + 1] * f)
+                buf[o + 2] = int(buf[o + 2] * f)
+
+
+def shadow_cols(x0, x1, fya, fyb):
+    """Soft 20% drop shadow for a column-span plate, halo radius RB, offset (4, 6)."""
+    left = x0 + DX - RB
+    right = x1 + DX + RB
+    for x in range(int(math.floor(left)), int(math.ceil(right))):
+        if x < 0 or x >= W:
+            continue
+        t = _ramp(x + 0.5, left, right, RB)
+        if t <= 0.0:
+            continue
+        xx = x - DX
+        if xx < x0:
+            xx = x0
+        elif xx > x1 - 1e-6:
+            xx = x1 - 1e-6
+        ya = fya(xx) + DY - RB
+        yb = fyb(xx) + DY + RB
+        ia = int(ya) if ya > 0.0 else 0
+        ib = int(math.ceil(yb))
+        if ib > H:
+            ib = H
+        if ib <= ia:
+            continue
+        base = x * 3
+        if t >= 1.0:
+            fi = 205
+            r0 = ia + int(RB) + 1
+            r1 = ib - int(RB) - 1
+            if r1 > r0:
+                for i in range(ia, r0):
+                    k = _ramp(i + 0.5, ya, yb, RB)
+                    if k > 0.0:
+                        f = 1.0 - 0.2 * k
+                        o = i * ROW + base
+                        buf[o] = int(buf[o] * f)
+                        buf[o + 1] = int(buf[o + 1] * f)
+                        buf[o + 2] = int(buf[o + 2] * f)
+                for i in range(r0, r1):
+                    o = i * ROW + base
+                    buf[o] = (buf[o] * fi) >> 8
+                    buf[o + 1] = (buf[o + 1] * fi) >> 8
+                    buf[o + 2] = (buf[o + 2] * fi) >> 8
+                for i in range(r1, ib):
+                    k = _ramp(i + 0.5, ya, yb, RB)
+                    if k > 0.0:
+                        f = 1.0 - 0.2 * k
+                        o = i * ROW + base
+                        buf[o] = int(buf[o] * f)
+                        buf[o + 1] = int(buf[o + 1] * f)
+                        buf[o + 2] = int(buf[o + 2] * f)
+                continue
+        for i in range(ia, ib):
+            k = t * _ramp(i + 0.5, ya, yb, RB)
+            if k <= 0.0:
+                continue
+            f = 1.0 - 0.2 * k
+            o = i * ROW + base
+            buf[o] = int(buf[o] * f)
+            buf[o + 1] = int(buf[o + 1] * f)
+            buf[o + 2] = int(buf[o + 2] * f)
+
+
+def plate(y0, y1, fxa, fxb, col, shadow=True):
+    """A row-span paper plate: drop shadow first, then the flat fill."""
+    if shadow:
+        shadow_rows(y0, y1, fxa, fxb)
+    fill_rows(y0, y1, fxa, fxb, col)
+
+
+def plate_cols(x0, x1, fya, fyb, col, shadow=True):
+    """A column-span paper plate: drop shadow first, then the flat fill."""
+    if shadow:
+        shadow_cols(x0, x1, fya, fyb)
+    fill_cols(x0, x1, fya, fyb, col)
+
+
+def rim(x0, x1, top, thick, alpha):
+    """A thin lit line under a cut edge -- the visible thickness of the paper."""
+    fill_cols(x0, x1, top, lambda x: top(x) + thick, (255, 255, 255),
+              alpha=alpha)
+
+
+# ---------------------------------------------------------------------------
+# layer 1 -- sky and punched stars
+# ---------------------------------------------------------------------------
+_seed = 20261112
+
+
+def rnd():
+    global _seed
+    _seed = (_seed * 1103515245 + 12345) & 0x7FFFFFFF
+    return _seed
+
+
+MOON_CX, MOON_CY, MOON_R = 236.0, 452.0, 58.0
+APEX_X, APEX_Y = 790.0, 274.0
+
+
+def draw_stars():
+    for _ in range(92):
+        cx = float(rnd() % W)
+        cy = 22.0 + (rnd() % 560)
+        rad = 1.05 + (rnd() % 100) / 100.0 * 1.45
+        if cy > 588.0 or math.hypot(cx - MOON_CX, cy - MOON_CY) < MOON_R + 16.0:
+            continue
+        plate(int(cy - rad - 1), int(cy + rad + 2),
+              lambda y, cx=cx, cy=cy, rad=rad: cx - math.sqrt(
+                  max(0.0, rad * rad - (y + 0.5 - cy) ** 2)),
+              lambda y, cx=cx, cy=cy, rad=rad: cx + math.sqrt(
+                  max(0.0, rad * rad - (y + 0.5 - cy) ** 2)),
+              STAR, shadow=False)
+
+
+# ---------------------------------------------------------------------------
+# layer 2 -- low moon
+# ---------------------------------------------------------------------------
+def draw_moon():
+    plate(int(MOON_CY - MOON_R - 1), int(MOON_CY + MOON_R + 2),
+          lambda y: MOON_CX - math.sqrt(
+              max(0.0, MOON_R ** 2 - (y + 0.5 - MOON_CY) ** 2)),
+          lambda y: MOON_CX + math.sqrt(
+              max(0.0, MOON_R ** 2 - (y + 0.5 - MOON_CY) ** 2)),
+          MOON)
+
+
+# ---------------------------------------------------------------------------
+# layer 3 -- the beam: translucent pale-gold wedge (the one gradient allowed)
+# ---------------------------------------------------------------------------
+FALL = [0.30 + 0.70 * (1.0 - abs(2.0 * (k + 0.5) / 128.0 - 1.0)) ** 0.55
+        for k in range(128)]
+BEAM_X0 = -40.0
+
+
+def draw_beam():
+    r, g, b = BEAM
+    span = APEX_X - BEAM_X0
+    for x in range(0, int(APEX_X)):
+        t = (APEX_X - x) / span          # 0 at the lantern, 1 at the far end
+        ya = APEX_Y + t * (88.0 - APEX_Y)
+        yb = APEX_Y + t * (436.0 - APEX_Y)
+        a_len = 0.72 - 0.30 * t
+        res = cuts(ya, yb, H)
+        if res is None:
+            continue
+        parts, mid = res
+        inv = 1.0 / (yb - ya)
+        base = x * 3
+        for i, c in parts:
+            w = FALL[min(127, int((i + 0.5 - ya) * inv * 128.0))]
+            a = a_len * w * c
+            ia = 1.0 - a
+            o = i * ROW + base
+            buf[o] = int(buf[o] * ia + r * a + 0.5)
+            buf[o + 1] = int(buf[o + 1] * ia + g * a + 0.5)
+            buf[o + 2] = int(buf[o + 2] * ia + b * a + 0.5)
+        if mid:
+            for i in range(mid[0], mid[1]):
+                w = FALL[min(127, int((i + 0.5 - ya) * inv * 128.0))]
+                a = a_len * w
+                ia = 1.0 - a
+                o = i * ROW + base
+                buf[o] = int(buf[o] * ia + r * a + 0.5)
+                buf[o + 1] = int(buf[o + 1] * ia + g * a + 0.5)
+                buf[o + 2] = int(buf[o + 2] * ia + b * a + 0.5)
+
+    # hotter core running down the middle of the same paper wedge
+    cr, cg, cb = 255, 238, 156
+    for x in range(0, int(APEX_X)):
+        t = (APEX_X - x) / span
+        ya = APEX_Y + t * (88.0 - APEX_Y)
+        yb = APEX_Y + t * (436.0 - APEX_Y)
+        a_core = 0.30 * (1.0 - t) ** 0.70
+        ycen = 0.5 * (ya + yb)
+        hw = 0.44 * (yb - ya)
+        res = cuts(ycen - hw, ycen + hw, H)
+        if res is None:
+            continue
+        parts, mid = res
+        inv = 1.0 / (2.0 * hw)
+        base = x * 3
+        for i, c in parts:
+            w = FALL[min(127, int((i + 0.5 - (ycen - hw)) * inv * 128.0))]
+            a = a_core * w * c
+            ia = 1.0 - a
+            o = i * ROW + base
+            buf[o] = int(buf[o] * ia + cr * a + 0.5)
+            buf[o + 1] = int(buf[o + 1] * ia + cg * a + 0.5)
+            buf[o + 2] = int(buf[o + 2] * ia + cb * a + 0.5)
+        if mid:
+            for i in range(mid[0], mid[1]):
+                w = FALL[min(127, int((i + 0.5 - (ycen - hw)) * inv * 128.0))]
+                a = a_core * w
+                ia = 1.0 - a
+                o = i * ROW + base
+                buf[o] = int(buf[o] * ia + cr * a + 0.5)
+                buf[o + 1] = int(buf[o + 1] * ia + cg * a + 0.5)
+                buf[o + 2] = int(buf[o + 2] * ia + cb * a + 0.5)
+
+
+# ---------------------------------------------------------------------------
+# layers 4-6 -- sea plates with scalloped paper crests
+# ---------------------------------------------------------------------------
+def sea_top(base_y, amp, freq, phase, scallop, period):
+    def f(x):
+        u = (x / period) % 1.0
+        return (base_y + amp * math.sin(freq * x + phase)
+                - scallop * math.sin(math.pi * u))
+    return f
+
+
+def draw_sea():
+    bands = (
+        (596.0, 5.0, 0.009, 1.2, 16.0, 128.0, SEA_FAR),
+        (700.0, 6.0, 0.011, 0.4, 18.0, 120.0, SEA_MID),
+        (812.0, 6.0, 0.007, 2.1, 22.0, 156.0, SEA_NEAR),
+    )
+    for base_y, amp, freq, phase, scallop, period, col in bands:
+        top = sea_top(base_y, amp, freq, phase, scallop, period)
+        plate_cols(0, W, top, lambda x: float(H), col)
+        rim(0, W, lambda x, t=top: t(x) + 1.0, 1.1, 0.085)
+
+
+# ---------------------------------------------------------------------------
+# layer 7 -- pale cliff on the right
+# ---------------------------------------------------------------------------
+CLIFF_PTS = (
+    (496.0, 1024.0), (548.0, 952.0), (596.0, 886.0), (632.0, 822.0),
+    (660.0, 758.0), (684.0, 700.0), (700.0, 648.0), (712.0, 596.0),
+    (726.0, 552.0), (748.0, 532.0), (776.0, 521.0), (812.0, 516.0),
+    (880.0, 513.0), (1024.0, 510.0),
 )
 
-
-# --------------------------------------------------------------------------
-# renderer
-# --------------------------------------------------------------------------
-
-def render():
-    exp = math.exp
-    sqrt = math.sqrt
-    fabs = math.fabs
-    pi = math.pi
-
-    rows = []
-    for j in range(H):
-        y = (j + 0.5) * INV - 1.0
-        rh = bytearray(HALF * 3)
-        p = 0
-
-        # ---- per-row body profile -------------------------------------
-        s = (y + 0.44) / 1.06
-        body_on = -0.02 < s < 1.06
-        bw = 0.0
-        if body_on:
-            bw = 0.021
-            bw += 0.038 * exp(-((s - 0.090) / 0.130) ** 2)
-            bw += 0.022 * exp(-((s - 0.420) / 0.300) ** 2)
-            bw *= 1.0 - smoothstep(0.76, 1.00, s)
-            bw *= smoothstep(-0.02, 0.015, s)
-            if bw < 0.0:
-                bw = 0.0
-
-        for i in range(HALF):
-            x = (i + 0.5) * INV
-
-            # ---------------- sky: deep violet -> near black -----------
-            r2 = x * x + y * y
-            t = r2 * 0.60
-            if t > 1.0:
-                t = 1.0
-            tt = t * t * (3.0 - 2.0 * t)
-            r = sqrt(r2)
-
-            cr = 0.108 * (1.0 - tt) + 0.011 * tt
-            cg = 0.046 * (1.0 - tt) + 0.007 * tt
-            cb = 0.196 * (1.0 - tt) + 0.022 * tt
-
-            # faint violet halo where the corona bleeds into the dark
-            hz = 0.042 * exp(-((r - 0.70) / 0.34) ** 2)
-            cr += hz * 0.95
-            cg += hz * 0.42
-            cb += hz * 1.25
-
-            # ---------------- wing plate -------------------------------
-            d = smin(ell(FORE, x, y, sqrt), ell(HIND, x, y, sqrt), 0.100)
-            cov = 1.0 - smoothstep(-AA, AA, d)
-
-            # ---------------- corona outside the edge ------------------
-            if cov < 0.999:
-                dn = d if d > 0.0 else 0.0
-                if dn < 0.42:
-                    k = (r - 0.15) * 1.34
-                    if k < 0.0:
-                        k = 0.0
-                    elif k > 1.0:
-                        k = 1.0
-                    tipw = 0.30 + 0.98 * (k ** 1.45)
-
-                    core = exp(-((dn - 0.0085) * 62.0) ** 2)
-                    mid = exp(-dn * 17.0)
-                    far = exp(-dn * 5.5)
-                    g = tipw * (1.02 * core + 0.50 * mid + 0.15 * far)
-                    g *= (1.0 - cov)
-                    if g > 0.001:
-                        gi = g if g < 1.0 else 1.0
-                        cr += (1.00 - 0.02 * gi) * g
-                        cg += (0.80 + 0.20 * gi) * g
-                        cb += (0.50 + 0.46 * gi) * g
-
-            # ---------------- wing plate fill + inner rim -------------
-            if cov > 0.001:
-                din = -d
-                bleed = exp(-(din if din > 0.0 else 0.0) * 15.0)
-                pr = 0.030 + bleed * 0.46
-                pg = 0.024 + bleed * 0.33
-                pb = 0.052 + bleed * 0.13
-                cr = cr * (1.0 - cov) + pr * cov
-                cg = cg * (1.0 - cov) + pg * cov
-                cb = cb * (1.0 - cov) + pb * cov
-
-                inn = exp(-((din - 0.0060) * 85.0) ** 2)
-                if inn > 0.002:
-                    kk = (r - 0.15) * 1.34
-                    if kk < 0.0:
-                        kk = 0.0
-                    elif kk > 1.0:
-                        kk = 1.0
-                    rw = (0.42 + 0.72 * kk) * inn * cov
-                    cr += 1.00 * rw
-                    cg += 0.88 * rw
-                    cb += 0.62 * rw
-
-            # ---------------- slim body + rounded head -----------------
-            hb = 1e3
-            if -0.505 < y < -0.345:
-                hb = ell(HEAD, x, y, sqrt)
-            if (body_on and bw > 0.0005) or hb < 0.4:
-                db = fabs(x) - bw if bw > 0.0005 else 1e3
-                if hb < 0.4:
-                    db = smin(db, hb, 0.020)
-                covb = 1.0 - smoothstep(-AA, AA, db)
-                if covb > 0.002:
-                    br = 0.040
-                    bg_ = 0.030
-                    bb = 0.058
-                    cr = cr * (1.0 - covb) + br * covb
-                    cg = cg * (1.0 - covb) + bg_ * covb
-                    cb = cb * (1.0 - covb) + bb * covb
-                    rim = exp(-((db + 0.0016) * 300.0) ** 2)
-                    rim *= 0.55 * covb
-                    cr += 1.00 * rim
-                    cg += 0.84 * rim
-                    cb += 0.58 * rim
-
-            # ---------------- feathery antenna --------------------------
-            if y < -0.425 and x < 0.470:
-                ta = -(y - AY0) / (-AYS)
-                if 0.0 <= ta < 1.04:
-                    xsp = AX0 + AXS * (ta ** APOW)
-                    perp = fabs(x - xsp)
-                    if perp < 0.075:
-                        slope = (AXS * APOW * (ta ** 0.6 if ta > 1e-6 else 0.0)) / (-AYS)
-                        perp = perp / sqrt(1.0 + slope * slope)
-                        ts = clamp01(ta)
-                        wave = math.sin(pi * ts)
-                        spine = exp(-(perp / (0.0040 + 0.0018 * wave)) ** 2)
-                        fe = 0.009 + 0.015 * wave * wave
-                        rib = 0.40 * exp(-(perp / fe) ** 2)
-                        rib *= 0.58 + 0.42 * math.cos(2.0 * pi * TEETH * ts)
-                        a = spine + rib * wave * 0.85 + 0.12 * exp(-(perp / 0.014) ** 2)
-                        if a > 0.003:
-                            if a > 1.0:
-                                a = 1.0
-                            cr += 1.00 * a
-                            cg += 0.93 * a
-                            cb += 0.76 * a
-
-            # ---------------- gold dust ---------------------------------
-            for mx, my, mr, ma in MOTES:
-                ddx = x - mx
-                if ddx > 0.03 or ddx < -0.03:
-                    continue
-                ddy = y - my
-                dd = (ddx * ddx + ddy * ddy) / (mr * mr)
-                if dd < 9.0:
-                    a = ma * exp(-dd * 1.8)
-                    cr += 1.00 * a
-                    cg += 0.87 * a
-                    cb += 0.55 * a
-
-            # ---------------- write -------------------------------------
-            rv = int(cr * 255.0 + 0.5)
-            gv = int(cg * 255.0 + 0.5)
-            bv = int(cb * 255.0 + 0.5)
-            if rv > 255:
-                rv = 255
-            elif rv < 0:
-                rv = 0
-            if gv > 255:
-                gv = 255
-            elif gv < 0:
-                gv = 0
-            if bv > 255:
-                bv = 255
-            elif bv < 0:
-                bv = 0
-            rh[p] = rv
-            rh[p + 1] = gv
-            rh[p + 2] = bv
-            p += 3
-
-        # mirror the right half into the left half (byte-slice reversal)
-        lh = bytearray(HALF * 3)
-        lh[0::3] = rh[0::3][::-1]
-        lh[1::3] = rh[1::3][::-1]
-        lh[2::3] = rh[2::3][::-1]
-        rows.append(b"\x00" + bytes(lh) + bytes(rh))
-
-    return rows
+# the sloping face, inverted: (y, leftmost x) rows, used for its drop shadow
+CLIFF_LEFT = tuple((y, x) for x, y in reversed(CLIFF_PTS[:9]))
 
 
-# --------------------------------------------------------------------------
-# PNG container
-# --------------------------------------------------------------------------
+def cliff_top(x):
+    if x < CLIFF_PTS[0][0]:
+        return float(H)
+    for k in range(len(CLIFF_PTS) - 1):
+        x0, y0 = CLIFF_PTS[k]
+        x1, y1 = CLIFF_PTS[k + 1]
+        if x <= x1:
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return CLIFF_PTS[-1][1]
+
+
+def cliff_left(y):
+    """Inverse of the cliff's sloping face: the leftmost cliff column per row."""
+    if y < CLIFF_LEFT[0][0]:
+        return float(W)
+    for k in range(len(CLIFF_LEFT) - 1):
+        y0, x0 = CLIFF_LEFT[k]
+        y1, x1 = CLIFF_LEFT[k + 1]
+        if y <= y1:
+            t = (y - y0) / (y1 - y0)
+            return x0 + t * (x1 - x0)
+    return CLIFF_LEFT[-1][1]
+
+
+def draw_cliff():
+    # the sloping face is near-vertical, so its shadow runs as row spans;
+    # the flat top is near-horizontal, so that shadow runs as column spans
+    shadow_rows(int(CLIFF_LEFT[0][0]), H,
+                lambda y: cliff_left(y), lambda y: float(W))
+    shadow_cols(int(CLIFF_LEFT[0][1]), W, cliff_top, lambda x: float(H))
+    fill_cols(0, W, cliff_top, lambda x: float(H), CLIFF)
+    rim(0, W, lambda x: cliff_top(x) + 1.0, 1.1, 0.09)
+
+
+# ---------------------------------------------------------------------------
+# layer 8 -- the lighthouse
+# ---------------------------------------------------------------------------
+LH_CX = 790.0
+BODY_TOP, BODY_BOT = 306.0, 572.0
+TOP_HALF, BOT_HALF = 34.0, 66.0
+LAN_TOP, LAN_HALF = 250.0, 40.0
+ROOF_TOP, ROOF_HALF = 231.0, 11.0
+
+
+def body_half(y):
+    t = (y - BODY_TOP) / (BODY_BOT - BODY_TOP)
+    return TOP_HALF + t * (BOT_HALF - TOP_HALF)
+
+
+def draw_lighthouse():
+    # white tower
+    plate(int(BODY_TOP), int(BODY_BOT) + 1,
+          lambda y: LH_CX - body_half(y + 0.5),
+          lambda y: LH_CX + body_half(y + 0.5), LH_WHITE)
+    # lantern room, warm yellow, sitting straight on the tower
+    plate(int(LAN_TOP), int(BODY_TOP) + 1,
+          lambda y: LH_CX - LAN_HALF, lambda y: LH_CX + LAN_HALF, LANTERN)
+    # flared roof
+    plate(int(ROOF_TOP), int(LAN_TOP) + 1,
+          lambda y: LH_CX - (ROOF_HALF + (LAN_HALF + 7.0 - ROOF_HALF)
+                             * (y + 0.5 - ROOF_TOP) / (LAN_TOP - ROOF_TOP)),
+          lambda y: LH_CX + (ROOF_HALF + (LAN_HALF + 7.0 - ROOF_HALF)
+                             * (y + 0.5 - ROOF_TOP) / (LAN_TOP - ROOF_TOP)),
+          LH_DARK)
+    # two thin dark paper rings, each shadowed against the white tower
+    for y0 in (392, 462):
+        plate(y0, y0 + 18,
+              lambda y: LH_CX - body_half(y + 0.5) - 3.0,
+              lambda y: LH_CX + body_half(y + 0.5) + 3.0, LH_DARK)
+
+
+# ---------------------------------------------------------------------------
+# paint + encode
+# ---------------------------------------------------------------------------
+def paint():
+    draw_stars()
+    draw_moon()
+    draw_beam()
+    draw_sea()
+    draw_cliff()
+    draw_lighthouse()
+
 
 def _chunk(tag, data):
-    return (struct.pack(">I", len(data)) + tag + data +
-            struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    return (struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
 
 
-def write_png(path, rows):
-    raw = b"".join(rows)
-    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
-    png = (b"\x89PNG\r\n\x1a\n" +
-           _chunk(b"IHDR", ihdr) +
-           _chunk(b"IDAT", zlib.compress(raw, 9)) +
-           _chunk(b"IEND", b""))
-    with open(path, "wb") as fh:
-        fh.write(png)
-    return len(png)
+def encode():
+    raw = bytearray()
+    for y in range(H):
+        o = y * ROW
+        raw.append(0)
+        raw += buf[o:o + ROW]
+    comp = zlib.compress(bytes(raw), 9)
+    return (b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+            + _chunk(b"IDAT", comp)
+            + _chunk(b"IEND", b""))
 
 
 def main():
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "./output")
     os.makedirs(out_dir, exist_ok=True)
-    rows = render()
+    paint()
+    data = encode()
     path = os.path.join(out_dir, "entry.png")
-    size = write_png(path, rows)
-    print("wrote %s  %d bytes  %dx%d" % (path, size, W, H))
+    with open(path, "wb") as f:
+        f.write(data)
+    print("wrote %s  %d bytes  %dx%d" % (path, len(data), W, H))
 
 
 if __name__ == "__main__":
